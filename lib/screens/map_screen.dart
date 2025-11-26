@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:safepath/widgets/safety_marker.dart';
@@ -12,6 +13,7 @@ import 'package:safepath/services/places_service.dart';
 import 'package:safepath/services/weather_service.dart';
 import 'package:safepath/services/voice_service.dart';
 import 'package:safepath/models/location_model.dart' as LM;
+import 'package:safepath/services/route_safety_analyzer.dart';
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key});
@@ -31,7 +33,12 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   LatLng? _destination;
   bool _offlineMode = false;
   WeatherData? _currentWeather;
-  bool _isNavigating = false;
+
+  // Route / navigation info
+  double? _routeDistanceKm;
+  int? _routeEstimatedMinutes;
+  String? _routeSafetyLabel;
+  double? _routeSafetyScore;
 
   @override
   void initState() {
@@ -180,17 +187,58 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           final lat = (z['lat'] as num).toDouble();
           final lng = (z['lng'] as num).toDouble();
 
+          // Determine safety level based on intensity
+          final safetyLevel = _getIntensitySafetyLevel(intensity);
+          final color = PlacesService.getSafetyColor(safetyLevel);
+          
           _heatmapCircles.add(Circle(
             circleId: CircleId('heat_$i'),
             center: LatLng(lat, lng),
             radius: 100 * intensity,
-            fillColor: Colors.red.withOpacity((intensity / 10).clamp(0.05, 0.4)),
-            strokeColor: Colors.transparent,
+            fillColor: color.withOpacity((intensity / 10).clamp(0.05, 0.4)),
+            strokeColor: color.withOpacity(0.5),
+            strokeWidth: 1,
           ));
         }
+        
+        // Add safety zones around mock safety reports
+        _addSafetyZonesToMap();
       });
     } catch (e) {
       // ignore weather errors - non-critical
+    }
+  }
+
+  /// Converts heat intensity (0-10) to safety level
+  PlaceSafetyLevel _getIntensitySafetyLevel(double intensity) {
+    if (intensity < 2) {
+      return PlaceSafetyLevel.safe;
+    } else if (intensity < 6) {
+      return PlaceSafetyLevel.moderate;
+    } else {
+      return PlaceSafetyLevel.unsafe;
+    }
+  }
+
+  /// Adds safety zone circles to the map based on safety reports
+  void _addSafetyZonesToMap() {
+    final reports = _getMockSafetyReports();
+    for (var i = 0; i < reports.length; i++) {
+      final report = reports[i];
+      final color = report.type == SafetyType.safe
+          ? const Color(0xFF4CAF50) // Green
+          : report.type == SafetyType.moderate
+              ? const Color(0xFFFFC107) // Amber
+              : const Color(0xFFF44336); // Red
+
+      _heatmapCircles.add(Circle(
+        circleId: CircleId('safety_zone_$i'),
+        center: report.location,
+        radius: 300, // 300m radius for safety zones
+        fillColor: color.withOpacity(0.15),
+        strokeColor: color,
+        strokeWidth: 2,
+      ));
     }
   }
 
@@ -198,7 +246,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (_currentLocation == null || _destination == null) return;
 
     setState(() {
-      _isNavigating = true;
       _polylines.clear();
     });
 
@@ -228,29 +275,99 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       ));
     });
 
-    // compute route summary (distance and traffic)
+    // Analyze route safety and prepare route info (distance, ETA, safety)
     try {
       final startLm = start;
       final endLm = end;
       final km = RoutingService().distanceKm(startLm, endLm);
       final trafficFactor = RoutingService().estimateTrafficFactor(startLm, endLm);
+
+      // Analyze safety along the route
+      final routeAnalysis = RouteSafetyAnalyzer.analyzeRouteSafety(
+        _currentLocation!,
+        _destination!,
+        _getMockSafetyReports(),
+      );
+
       // assume average speed 40 km/h, adjust for traffic
       final avgSpeed = 40.0 / trafficFactor; // km/h
       final hours = km / avgSpeed;
       final minutes = (hours * 60).round();
 
-      final summary = '${km.toStringAsFixed(1)} km • $minutes min • Traffic x${trafficFactor.toStringAsFixed(1)}';
+      final safetyLabel = PlacesService.getSafetyLabel(routeAnalysis.overallSafetyLevel);
+
+      // Update state so UI can show persistent route info
+      setState(() {
+        _routeDistanceKm = km;
+        _routeEstimatedMinutes = minutes;
+        _routeSafetyLabel = safetyLabel;
+        _routeSafetyScore = routeAnalysis.averageSafetyScore;
+      });
+
+      // add km markers along route
+      _addKilometerMarkers(points, km);
+
+      final safetyPercentage = (routeAnalysis.averageSafetyScore * 100).toStringAsFixed(0);
+      final summary = '${km.toStringAsFixed(2)} km • $minutes min • Safety: $safetyLabel ($safetyPercentage%)';
+
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Route: $summary')));
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Route: $summary\n${routeAnalysis.recommendation}'),
+            duration: const Duration(seconds: 4),
+          ),
+        );
       }
+
       try {
-        await VoiceService().speak('Navigation started. $km kilometers to destination. Estimated $minutes minutes.');
+        await VoiceService().speak(
+          'Navigation started. ${km.toStringAsFixed(2)} kilometers to destination. Estimated $minutes minutes. $safetyLabel route. ${routeAnalysis.recommendation}',
+        );
       } catch (_) {}
-    } catch (_) {}
-    // give a short spoken summary if available
-    try {
-      await VoiceService().speak('Navigation started. Following the safest route.');
-    } catch (_) {}
+    } catch (err) {
+      // fallback spoken message
+      try {
+        await VoiceService().speak('Navigation started. Following the route.');
+      } catch (_) {}
+    }
+  }
+
+  /// Mock safety reports for route analysis
+  List<SafetyReport> _getMockSafetyReports() {
+    return [
+      SafetyReport(
+        id: 'sr_1',
+        location: const LatLng(28.6149, 77.2190),
+        type: SafetyType.safe,
+        description: 'Well lit area with good foot traffic',
+        rating: 4.5,
+        timestamp: DateTime.now().subtract(const Duration(hours: 2)),
+      ),
+      SafetyReport(
+        id: 'sr_2',
+        location: const LatLng(28.6139, 77.2100),
+        type: SafetyType.moderate,
+        description: 'Moderate crowd during evenings',
+        rating: 3.0,
+        timestamp: DateTime.now().subtract(const Duration(hours: 5)),
+      ),
+      SafetyReport(
+        id: 'sr_3',
+        location: const LatLng(28.6159, 77.2180),
+        type: SafetyType.unsafe,
+        description: 'Reported incidents in this area',
+        rating: 2.0,
+        timestamp: DateTime.now().subtract(const Duration(hours: 12)),
+      ),
+      SafetyReport(
+        id: 'sr_4',
+        location: const LatLng(28.6140, 77.2095),
+        type: SafetyType.safe,
+        description: 'Police patrol visible',
+        rating: 4.8,
+        timestamp: DateTime.now().subtract(const Duration(hours: 1)),
+      ),
+    ];
   }
 
   Future<void> _toggleOfflineCache() async {
@@ -272,6 +389,87 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       }
     }
   }
+
+  /// Cancel navigation and allow selection of new destination
+  void _cancelNavigation() {
+    setState(() {
+      _destination = null;
+      _polylines.clear();
+      _markers.removeWhere((m) => m.markerId.value == 'destination' || m.markerId.value.startsWith('km_'));
+      _routeDistanceKm = null;
+      _routeEstimatedMinutes = null;
+      _routeSafetyLabel = null;
+      _routeSafetyScore = null;
+    });
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Navigation cancelled. Select a new destination.'),
+          action: SnackBarAction(
+            label: 'Choose',
+            onPressed: () => _openDestinationPicker(),
+          ),
+          duration: const Duration(seconds: 3),
+        ),
+      );
+    }
+
+    try {
+      VoiceService().speak('Navigation cancelled.');
+    } catch (_) {}
+  }
+
+
+  /// Adds simple kilometer markers along the route polyline.
+  void _addKilometerMarkers(List<LatLng> points, double totalKm) {
+    // clear previous km markers
+    _markers.removeWhere((m) => m.markerId.value.startsWith('km_'));
+
+    if (points.isEmpty || totalKm <= 0) return;
+
+    double accumulated = 0.0;
+    double nextKmTarget = 1.0;
+
+    for (int i = 1; i < points.length; i++) {
+      final segStart = points[i - 1];
+      final segEnd = points[i];
+      final segDist = _haversineDistance(segStart, segEnd);
+      accumulated += segDist;
+
+      while (accumulated >= nextKmTarget && nextKmTarget <= totalKm.ceil()) {
+        // place marker at segEnd (best-effort)
+        final kmLabel = nextKmTarget.toInt();
+        final marker = Marker(
+          markerId: MarkerId('km_$kmLabel'),
+          position: segEnd,
+          infoWindow: InfoWindow(title: '$kmLabel km'),
+          icon: BitmapDescriptor.defaultMarkerWithHue(BitmapDescriptor.hueAzure),
+        );
+        _markers.add(marker);
+        nextKmTarget += 1.0;
+      }
+    }
+
+    // update map
+    setState(() {});
+  }
+
+  /// Haversine distance in kilometers between two points
+  double _haversineDistance(LatLng a, LatLng b) {
+    const R = 6371.0; // Earth radius km
+    final dLat = _degreesToRadians(b.latitude - a.latitude);
+    final dLng = _degreesToRadians(b.longitude - a.longitude);
+    final lat1 = _degreesToRadians(a.latitude);
+    final lat2 = _degreesToRadians(b.latitude);
+    final sinDLat = sin(dLat / 2);
+    final sinDLng = sin(dLng / 2);
+    final aa = sinDLat * sinDLat + sinDLng * sinDLng * cos(lat1) * cos(lat2);
+    final c = 2 * atan2(sqrt(aa), sqrt(1 - aa));
+    return R * c;
+  }
+
+  double _degreesToRadians(double deg) => deg * pi / 180;
 
   void _loadSafetyMarkers() {
     // Mock data - in real app, this would come from backend
@@ -357,6 +555,31 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                   title: const Text('Pick a nearby place'),
                   subtitle: const Text('Or enter lat,lng manually'),
                 ),
+                // Safety Legend
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceAround,
+                    children: [
+                      _buildSafetyLegendItem(
+                        'Safe',
+                        PlacesService.getSafetyColor(PlaceSafetyLevel.safe),
+                        Icons.check_circle,
+                      ),
+                      _buildSafetyLegendItem(
+                        'Moderate',
+                        PlacesService.getSafetyColor(PlaceSafetyLevel.moderate),
+                        Icons.info,
+                      ),
+                      _buildSafetyLegendItem(
+                        'Unsafe',
+                        PlacesService.getSafetyColor(PlaceSafetyLevel.unsafe),
+                        Icons.warning,
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(),
                 Expanded(
                   child: places.isNotEmpty
                       ? ListView.builder(
@@ -364,18 +587,58 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                           itemCount: places.length,
                           itemBuilder: (context, index) {
                             final p = places[index];
-                            return ListTile(
-                              leading: const Icon(Icons.place),
-                              title: Text(p.name),
-                              subtitle: Text('${p.latitude.toStringAsFixed(5)}, ${p.longitude.toStringAsFixed(5)}'),
-                              onTap: () {
-                                Navigator.pop(ctx);
-                                setState(() {
-                                  _destination = LatLng(p.latitude, p.longitude);
-                                  _markers.removeWhere((m) => m.markerId.value == 'destination');
-                                  _markers.add(Marker(markerId: const MarkerId('destination'), position: _destination!, infoWindow: InfoWindow(title: p.name)));
-                                });
-                              },
+                            final safetyColor = PlacesService.getSafetyColor(p.safetyLevel);
+                            final safetyIcon = PlacesService.getSafetyIcon(p.safetyLevel);
+                            final safetyLabel = PlacesService.getSafetyLabel(p.safetyLevel);
+                            return Card(
+                              margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                              child: ListTile(
+                                leading: Icon(Icons.place, color: safetyColor),
+                                title: Text(p.name),
+                                subtitle: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text('${p.latitude.toStringAsFixed(5)}, ${p.longitude.toStringAsFixed(5)}'),
+                                    SizedBox(height: 4),
+                                    Row(
+                                      children: [
+                                        Icon(safetyIcon, size: 16, color: safetyColor),
+                                        SizedBox(width: 4),
+                                        Text(
+                                          safetyLabel,
+                                          style: TextStyle(color: safetyColor, fontWeight: FontWeight.bold),
+                                        ),
+                                        SizedBox(width: 8),
+                                        Text(
+                                          'Safety: ${(p.safetyScore * 100).toStringAsFixed(0)}%',
+                                          style: TextStyle(fontSize: 12),
+                                        ),
+                                        SizedBox(width: 8),
+                                        Text(
+                                          '${p.reportCount} reports',
+                                          style: TextStyle(fontSize: 12, color: Colors.grey),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                                trailing: Icon(Icons.arrow_forward),
+                                onTap: () {
+                                  Navigator.pop(ctx);
+                                  setState(() {
+                                    _destination = LatLng(p.latitude, p.longitude);
+                                    _markers.removeWhere((m) => m.markerId.value == 'destination');
+                                    _markers.add(Marker(
+                                      markerId: const MarkerId('destination'),
+                                      position: _destination!,
+                                      infoWindow: InfoWindow(
+                                        title: p.name,
+                                        snippet: '$safetyLabel - ${(p.safetyScore * 100).toStringAsFixed(0)}% safe',
+                                      ),
+                                    ));
+                                  });
+                                },
+                              ),
                             );
                           },
                         )
@@ -432,6 +695,29 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     );
   }
 
+  /// Builds a legend item for the safety color coding
+  Widget _buildSafetyLegendItem(String label, Color color, IconData icon) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Container(
+          padding: const EdgeInsets.all(6),
+          decoration: BoxDecoration(
+            color: color.withOpacity(0.2),
+            shape: BoxShape.circle,
+            border: Border.all(color: color, width: 2),
+          ),
+          child: Icon(icon, size: 16, color: color),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          label,
+          style: TextStyle(color: color, fontSize: 11, fontWeight: FontWeight.bold),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Stack(
@@ -482,31 +768,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             ),
           ),
 
-        // Navigation & Controls
-        Positioned(
-          right: 20,
-          bottom: 20,
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.end,
-            children: [
-              FloatingActionButton(
-                heroTag: 'nav',
-                onPressed: _destination == null
-                    ? () => _openDestinationPicker()
-                    : () => _startNavigation(),
-                backgroundColor: _destination == null ? Colors.blueGrey : AppColors.primary,
-                child: Icon(_destination == null ? Icons.search : Icons.navigation, color: Colors.white),
-              ),
-              const SizedBox(height: 12),
-              FloatingActionButton(
-                heroTag: 'offline',
-                onPressed: () => _toggleOfflineCache(),
-                backgroundColor: _offlineMode ? Colors.green : Colors.orange,
-                child: Icon(_offlineMode ? Icons.cloud_done : Icons.cloud_download, color: Colors.white),
-              ),
-            ],
-          ),
-        ),
+        
 
         // Safety Legend (theme-aware for dark mode)
         Positioned(
@@ -580,6 +842,115 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               );
             }),
           ),
+
+        // Destination Info Card
+        if (_destination != null)
+          Positioned(
+            bottom: 130,
+            left: 20,
+            right: 20,
+            child: Builder(builder: (ctx) {
+              final theme = Theme.of(ctx);
+              final cardColor = theme.cardColor;
+              final textColor = theme.textTheme.bodyMedium?.color ?? Colors.black;
+
+              return Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: cardColor,
+                  borderRadius: BorderRadius.circular(12),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.1),
+                      blurRadius: 8,
+                      offset: const Offset(0, 4),
+                    ),
+                  ],
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'Destination Set',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 13,
+                              color: textColor,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            '${_destination!.latitude.toStringAsFixed(4)}, ${_destination!.longitude.toStringAsFixed(4)}',
+                            style: TextStyle(
+                              fontSize: 11,
+                              color: Colors.grey,
+                            ),
+                          ),
+                          if (_routeDistanceKm != null) ...[
+                            const SizedBox(height: 6),
+                            Text(
+                              '${_routeDistanceKm!.toStringAsFixed(2)} km • ${_routeEstimatedMinutes ?? '--'} min • ${_routeSafetyLabel ?? '--'} (${((_routeSafetyScore ?? 0.0) * 100).toStringAsFixed(0)}%)',
+                              style: TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.edit),
+                      onPressed: () => _openDestinationPicker(),
+                      iconSize: 18,
+                      padding: EdgeInsets.zero,
+                    ),
+                    IconButton(
+                      icon: const Icon(Icons.close),
+                      onPressed: () => _cancelNavigation(),
+                      iconSize: 18,
+                      padding: EdgeInsets.zero,
+                      color: Colors.red,
+                    ),
+                  ],
+                ),
+              );
+            }),
+          ),
+
+        // Navigation & Controls (placed after destination card so buttons stay on top)
+        Positioned(
+          right: 20,
+          bottom: 20,
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: [
+              FloatingActionButton(
+                heroTag: 'nav',
+                onPressed: _destination == null
+                    ? () => _openDestinationPicker()
+                    : () => _startNavigation(),
+                backgroundColor: _destination == null ? Colors.blueGrey : AppColors.primary,
+                child: Icon(_destination == null ? Icons.search : Icons.navigation, color: Colors.white),
+              ),
+              const SizedBox(height: 12),
+              if (_destination != null)
+                FloatingActionButton(
+                  heroTag: 'cancel',
+                  onPressed: () => _cancelNavigation(),
+                  backgroundColor: Colors.red,
+                  child: const Icon(Icons.close, color: Colors.white),
+                ),
+              if (_destination != null) const SizedBox(height: 12),
+              FloatingActionButton(
+                heroTag: 'offline',
+                onPressed: () => _toggleOfflineCache(),
+                backgroundColor: _offlineMode ? Colors.green : Colors.orange,
+                child: Icon(_offlineMode ? Icons.cloud_done : Icons.cloud_download, color: Colors.white),
+              ),
+            ],
+          ),
+        ),
       ],
     );
   }
